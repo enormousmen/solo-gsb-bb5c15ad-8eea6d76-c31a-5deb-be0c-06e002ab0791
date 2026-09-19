@@ -13,7 +13,7 @@ from fastapi.responses import JSONResponse
 from . import db
 from .config import settings
 from .merge import apply_merge_patch, present_conflict, three_way_merge
-from .schemas import CreateDocument, SetContract, UpdateDocument
+from .schemas import CreateDocument, CreateRelease, SetContract, UpdateDocument
 from .validation import check_schema, validate_instance
 
 
@@ -26,7 +26,7 @@ async def lifespan(app: FastAPI) -> Iterator[None]:
 
 app = FastAPI(
     title="共享 JSON 配置三方合并 API",
-    version="1.0.0",
+    version="1.1.0",
     description="基于 JSON Merge Patch (RFC 7386) 的共享配置存储；"
     "基线过期时递归三方合并，路径冲突返回 409。",
     lifespan=lifespan,
@@ -49,6 +49,110 @@ def err(status_code: int, code: str, **extra: Any) -> HTTPException:
 
 def row_content(row: sqlite3.Row) -> Any:
     return json.loads(row["content"])
+
+
+# ---------------------------------------------------------------- 单项更新（共享）
+
+
+class _ItemError(Exception):
+    """单文档“基线→三方合并→契约校验”失败；调用方必须已在写事务内（失败即回滚）。
+
+    单文档 PATCH 直接把它翻译成 HTTP 错误；原子发布则收集为结构化失败项，
+    保证两条路径复用同一份合并与校验逻辑。
+    """
+
+    def __init__(self, code: str, status_code: int, **extra: Any) -> None:
+        self.code = code
+        self.status_code = status_code
+        self.extra = extra
+        super().__init__(code)
+
+
+def prepare_document_update(
+    conn: sqlite3.Connection,
+    doc_id: str,
+    base_revision: int,
+    patch: Any,
+    request_id: str,
+) -> dict[str, Any]:
+    """写事务内执行单项更新的**只读合并与校验**，返回落库所需的候选结果。
+
+    顺序与单文档 PATCH 完全一致：
+    ① 基线必须存在（``unknown_base_revision``）；
+    ② Merge Patch 应用到基线得到 theirs；基线过期时递归三方合并
+      （路径分歧 → ``conflict``）；
+    ③ 文档存在契约时校验最终候选（``schema_validation_failed``）。
+
+    本函数不写入任何数据，也不登记幂等记录；调用方负责插入修订 / 回滚。
+    """
+    doc = db.get_document(conn, doc_id)
+    if doc is None:
+        raise _ItemError("not_found", status.HTTP_404_NOT_FOUND, document_id=doc_id)
+
+    base_row = db.get_revision(conn, doc_id, base_revision)
+    if base_row is None:
+        raise _ItemError(
+            "unknown_base_revision",
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            document_id=doc_id,
+            base_revision=base_revision,
+            current_revision=doc["current_revision"],
+            reason="base_revision 不存在",
+        )
+
+    current_revision = doc["current_revision"]
+    current_content = json.loads(
+        db.get_revision(conn, doc_id, current_revision)["content"]
+    )
+    base_content = json.loads(base_row["content"])
+
+    # 第一步：把 Merge Patch 应用到基线上，得到“来稿想要的结果”
+    theirs = apply_merge_patch(base_content, patch)
+
+    if base_revision == current_revision:
+        # 基线就是当前版：快路径，无需三方比较
+        merged, replayed = theirs, False
+    else:
+        # 基线过期：递归比较 base / current / theirs
+        merged, raw_conflicts = three_way_merge(base_content, current_content, theirs)
+        replayed = True
+        if raw_conflicts:
+            raise _ItemError(
+                "conflict",
+                status.HTTP_409_CONFLICT,
+                document_id=doc_id,
+                request_id=request_id,
+                base_revision=base_revision,
+                current_revision=current_revision,
+                conflicts=[present_conflict(c) for c in raw_conflicts],
+            )
+
+    # 第二步（Merge Patch 与三方重放均完成后）：若文档存在契约，
+    # 校验最终候选内容。失败由调用方回滚——不写修订、不占用幂等 ID。
+    contract_row = db.get_contract(conn, doc_id)
+    if contract_row is not None:
+        contract_schema = json.loads(contract_row["schema_json"])
+        schema_errors = validate_instance(contract_schema, merged)
+        if schema_errors:
+            raise _ItemError(
+                "schema_validation_failed",
+                status.HTTP_422_UNPROCESSABLE_ENTITY,
+                document_id=doc_id,
+                request_id=request_id,
+                base_revision=base_revision,
+                current_revision=current_revision,
+                errors=schema_errors,
+            )
+
+    changed = db.canonical(merged) != db.canonical(current_content)
+    return {
+        "doc": doc,
+        "merged": merged,
+        "replayed": replayed,
+        "changed": changed,
+        "current_revision": current_revision,
+        "updated_at": db.utcnow() if changed else doc["updated_at"],
+    }
 
 
 # ---------------------------------------------------------------- 健康检查
@@ -316,19 +420,6 @@ def update_document(
             }
         )
 
-    base_row = db.get_revision(conn, doc_id, body.base_revision)
-    if base_row is None:
-        raise err(
-            status.HTTP_422_UNPROCESSABLE_ENTITY,
-            "unknown_base_revision",
-            document_id=doc_id,
-            base_revision=body.base_revision,
-            current_revision=doc["current_revision"],
-            reason="base_revision 不存在",
-        )
-
-    base_content = json.loads(base_row["content"])
-
     # 写事务内重读，消除“检查后写入”的并发窗口（BEGIN IMMEDIATE 取写锁）
     with db.transaction(conn):
         doc = db.get_document(conn, doc_id)
@@ -356,54 +447,21 @@ def update_document(
             }
             return JSONResponse(payload)
 
-        current_revision = doc["current_revision"]
-        current_content = json.loads(
-            db.get_revision(conn, doc_id, current_revision)["content"]
-        )
-
-        # 第一步：把 Merge Patch 应用到基线上，得到“来稿想要的结果”
-        theirs = apply_merge_patch(base_content, body.patch)
-
-        if body.base_revision == current_revision:
-            # 基线就是当前版：快路径，无需三方比较
-            merged, replayed = theirs, False
-        else:
-            # 基线过期：递归比较 base / current / theirs
-            merged, raw_conflicts = three_way_merge(
-                base_content, current_content, theirs
+        try:
+            result = prepare_document_update(
+                conn,
+                doc_id,
+                body.base_revision,
+                body.patch,
+                body.request_id,
             )
-            replayed = True
-            if raw_conflicts:
-                # 冲突：事务回滚，绝不写入
-                conflicts_out = [present_conflict(c) for c in raw_conflicts]
-                raise err(
-                    status.HTTP_409_CONFLICT,
-                    "conflict",
-                    document_id=doc_id,
-                    request_id=body.request_id,
-                    base_revision=body.base_revision,
-                    current_revision=current_revision,
-                    conflicts=conflicts_out,
-                )
+        except _ItemError as exc:
+            raise err(exc.status_code, exc.code, **exc.extra)
 
-        # 第二步（Merge Patch 与三方重放均完成后）：若文档存在契约，
-        # 校验最终候选内容。失败则事务回滚——不写修订、不占用 request_id。
-        contract_row = db.get_contract(conn, doc_id)
-        if contract_row is not None:
-            contract_schema = json.loads(contract_row["schema_json"])
-            schema_errors = validate_instance(contract_schema, merged)
-            if schema_errors:
-                raise err(
-                    status.HTTP_422_UNPROCESSABLE_ENTITY,
-                    "schema_validation_failed",
-                    document_id=doc_id,
-                    request_id=body.request_id,
-                    base_revision=body.base_revision,
-                    current_revision=current_revision,
-                    errors=schema_errors,
-                )
-
-        changed = db.canonical(merged) != db.canonical(current_content)
+        merged = result["merged"]
+        replayed = result["replayed"]
+        changed = result["changed"]
+        current_revision = result["current_revision"]
         now = db.utcnow()
         if changed:
             new_revision = current_revision + 1
@@ -437,6 +495,156 @@ def update_document(
             "changed": changed,
             "idempotent": False,
             "content": merged,
-            "created_at": now if changed else doc["updated_at"],
+            "created_at": now if changed else result["updated_at"],
         }
     )
+
+
+# ---------------------------------------------------------------- 原子发布
+
+
+def _release_failure(index: int, document_id: str, exc: _ItemError) -> dict[str, Any]:
+    """把单项失败整理成按输入顺序汇总的结构化失败项。"""
+    failure: dict[str, Any] = {
+        "index": index,
+        "document_id": document_id,
+        "error": exc.code,
+        "status_code": exc.status_code,
+    }
+    failure.update(exc.extra)
+    return failure
+
+
+@app.post("/releases", tags=["releases"])
+def create_release(
+    body: CreateRelease, conn: sqlite3.Connection = Depends(get_conn)
+) -> JSONResponse:
+    """原子发布：在同一 SQLite 写事务内为多个文档各做一次三方合并 + 契约校验。
+
+    * 任一文档不存在 / 基线无效 / 合并冲突 / 契约校验失败
+      → 422 release_failed，``failures`` 按输入顺序汇总，全部文档不产生修订，
+      且 release_id 不被占用；
+    * 全部通过 → 一次性写入各文档新修订，返回每项最终 revision/content；
+    * release_id 对**规范化整批请求**持久化幂等：
+      相同请求（含顺序与 author）重放原结果，不同请求 409 release_id_conflict。
+    """
+    # 规范化指纹：按输入顺序记录每项 (document_id, base_revision, patch, author)，
+    # 紧凑且键排序的确定性 JSON；字段顺序/空白变化不影响语义。
+    fingerprint = hashlib.sha256(
+        db.canonical(
+            [
+                [item.document_id, item.base_revision, item.patch, item.author]
+                for item in body.updates
+            ]
+        ).encode("utf-8")
+    ).hexdigest()
+
+    existing = db.get_release(conn, body.release_id)
+    if existing is not None:
+        if existing["fingerprint"] != fingerprint:
+            raise err(
+                status.HTTP_409_CONFLICT,
+                "release_id_conflict",
+                release_id=body.release_id,
+                reason="同一 release_id 已用于 updates 不同的发布请求",
+            )
+        replay = json.loads(existing["results"])
+        replay["idempotent"] = True
+        return JSONResponse(replay)
+
+    # 单一写事务（BEGIN IMMEDIATE）：全部通过才提交，任一失败整体回滚。
+    with db.transaction(conn):
+        # 事务内重读幂等记录，消除与并发发布之间的竞态窗口。
+        existing = db.get_release(conn, body.release_id)
+        if existing is not None:
+            if existing["fingerprint"] != fingerprint:
+                raise err(
+                    status.HTTP_409_CONFLICT,
+                    "release_id_conflict",
+                    release_id=body.release_id,
+                    reason="同一 release_id 已用于 updates 不同的发布请求",
+                )
+            replay = json.loads(existing["results"])
+            replay["idempotent"] = True
+            return JSONResponse(replay)
+
+        # 逐项复用单文档 PATCH 的合并与契约校验逻辑，收集**全部**失败项。
+        failures: list[dict[str, Any]] = []
+        prepared: list[tuple[int, Any, dict[str, Any]]] = []
+        for index, item in enumerate(body.updates):
+            try:
+                prepared.append(
+                    (
+                        index,
+                        item,
+                        prepare_document_update(
+                            conn,
+                            item.document_id,
+                            item.base_revision,
+                            item.patch,
+                            body.release_id,
+                        ),
+                    )
+                )
+            except _ItemError as exc:
+                failures.append(_release_failure(index, item.document_id, exc))
+
+        if failures:
+            # 不捕获：db.transaction 回滚，修订与 release_id 均不落库。
+            raise err(
+                status.HTTP_422_UNPROCESSABLE_ENTITY,
+                "release_failed",
+                release_id=body.release_id,
+                reason="发布中存在失败项，全部文档未产生修订",
+                failures=failures,
+            )
+
+        # 全部通过：按输入顺序一次性写入各文档新修订。
+        # 发布内 document_id 已在模型层保证互不重复，故逐项 +1 互不影响。
+        now = db.utcnow()
+        results: list[dict[str, Any]] = []
+        for index, item, result in prepared:
+            current_revision = result["current_revision"]
+            merged = result["merged"]
+            changed = result["changed"]
+            if changed:
+                new_revision = current_revision + 1
+                db.insert_revision(
+                    conn,
+                    item.document_id,
+                    new_revision,
+                    merged,
+                    item.patch,
+                    item.base_revision,
+                    body.release_id,
+                    result["replayed"],
+                    item.author,
+                    now,
+                )
+                created_at = now
+            else:
+                # 自动重放后结果与当前版相同：不生成新修订
+                new_revision = current_revision
+                created_at = result["updated_at"]
+            results.append(
+                {
+                    "document_id": item.document_id,
+                    "revision": new_revision,
+                    "base_revision": item.base_revision,
+                    "replayed": result["replayed"],
+                    "changed": changed,
+                    "author": item.author,
+                    "content": merged,
+                    "created_at": created_at,
+                }
+            )
+
+        payload: dict[str, Any] = {
+            "release_id": body.release_id,
+            "idempotent": False,
+            "results": results,
+        }
+        # 仅持久化成功发布；失败路径在上面已抛出并回滚，不占用 release_id。
+        db.insert_release(conn, body.release_id, fingerprint, payload, now)
+
+    return JSONResponse(payload)

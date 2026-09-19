@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from typing import Any, Optional
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 # JSON 允许的值类型
 _JSON_TYPES = (dict, list, str, int, float, bool, type(None))
@@ -68,3 +68,57 @@ class SetContract(StrictModel):
         if not isinstance(v, (dict, bool)):
             raise ValueError("schema 必须是 JSON 对象或布尔值（JSON Schema 2020-12）")
         return v
+
+
+# ---------------------------------------------------------------- 原子发布
+
+
+class ReleaseItem(StrictModel):
+    document_id: str = Field(
+        ...,
+        min_length=1,
+        max_length=128,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9._~-]*$",
+        description="目标文档 ID",
+    )
+    base_revision: int = Field(
+        ..., ge=1, description="来稿所基于的修订号（文档读取时返回）"
+    )
+    patch: Any = Field(..., description="RFC 7386 JSON Merge Patch")
+    author: Optional[str] = Field(default=None, max_length=200)
+
+    @field_validator("patch")
+    @classmethod
+    def _json_only(cls, v: Any) -> Any:
+        if not isinstance(v, _JSON_TYPES):
+            raise ValueError("patch 必须是合法的 JSON 值")
+        return v
+
+
+class CreateRelease(StrictModel):
+    release_id: str = Field(
+        ...,
+        min_length=1,
+        max_length=200,
+        description="调用方生成的发布去重 ID（如 UUID），整批请求幂等",
+    )
+    updates: list[ReleaseItem] = Field(
+        ...,
+        min_length=2,
+        max_length=20,
+        description="同一写事务内原子应用的文档更新列表，每项 document_id 互不重复",
+    )
+
+    @model_validator(mode="after")
+    def _document_ids_unique(self) -> "CreateRelease":
+        seen: set[str] = set()
+        duplicates: list[str] = []
+        for item in self.updates:
+            if item.document_id in seen and item.document_id not in duplicates:
+                duplicates.append(item.document_id)
+            seen.add(item.document_id)
+        if duplicates:
+            raise ValueError(
+                f"updates 中的 document_id 必须互不重复，重复项: {', '.join(duplicates)}"
+            )
+        return self

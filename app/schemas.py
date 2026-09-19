@@ -53,6 +53,49 @@ class UpdateDocument(StrictModel):
         return v
 
 
+class ReleaseItem(StrictModel):
+    """原子发布中的单篇文档更新（语义与 PATCH /documents/{id} 一致）。"""
+
+    document_id: str = Field(..., min_length=1, max_length=128)
+    base_revision: int = Field(
+        ..., ge=1, description="来稿所基于的修订号（文档读取时返回）"
+    )
+    patch: Any = Field(..., description="RFC 7386 JSON Merge Patch")
+    author: Optional[str] = Field(default=None, max_length=200)
+
+    @field_validator("patch")
+    @classmethod
+    def _json_only(cls, v: Any) -> Any:
+        if not isinstance(v, _JSON_TYPES):
+            raise ValueError("patch 必须是合法的 JSON 值")
+        return v
+
+
+class CreateRelease(StrictModel):
+    release_id: str = Field(
+        ...,
+        min_length=1,
+        max_length=200,
+        description="调用方生成的整批去重 ID（如 UUID），同 ID+同内容幂等",
+    )
+    items: list[ReleaseItem] = Field(
+        ...,
+        min_length=2,
+        max_length=20,
+        description="2～20 项文档更新，document_id 互不重复，按输入顺序处理",
+    )
+
+    @field_validator("items")
+    @classmethod
+    def _unique_document_ids(cls, v: list[ReleaseItem]) -> list[ReleaseItem]:
+        seen: set[str] = set()
+        for item in v:
+            if item.document_id in seen:
+                raise ValueError(f"items 中 document_id 重复: {item.document_id}")
+            seen.add(item.document_id)
+        return v
+
+
 class SetContract(StrictModel):
     # JSON Schema 根必须是对象或布尔（true/false 布尔 Schema）；
     # 进一步的合法性（关键字、$ref 等）由 validation.check_schema 做元校验。

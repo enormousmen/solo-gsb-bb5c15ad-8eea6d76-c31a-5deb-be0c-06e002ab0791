@@ -45,6 +45,13 @@ CREATE TABLE IF NOT EXISTS contracts (
     schema_json TEXT NOT NULL,
     updated_at  TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS releases (
+    release_id  TEXT PRIMARY KEY,
+    fingerprint TEXT    NOT NULL,
+    response    TEXT    NOT NULL,
+    created_at  TEXT    NOT NULL
+);
 """
 
 
@@ -230,4 +237,28 @@ def insert_request(
         "INSERT INTO requests (document_id, request_id, fingerprint, revision, changed)"
         " VALUES (?, ?, ?, ?, ?)",
         (doc_id, request_id, fingerprint, revision, 1 if changed else 0),
+    )
+
+
+# ---------- 原子发布（整批幂等） ----------
+
+
+def get_release(conn: sqlite3.Connection, release_id: str) -> Optional[sqlite3.Row]:
+    return conn.execute(
+        "SELECT * FROM releases WHERE release_id = ?", (release_id,)
+    ).fetchone()
+
+
+def insert_release(
+    conn: sqlite3.Connection,
+    release_id: str,
+    fingerprint: str,
+    response: str,
+    now: str,
+) -> None:
+    """调用方需已开启写事务。仅整批成功时才调用——失败不占用 release_id。"""
+    conn.execute(
+        "INSERT INTO releases (release_id, fingerprint, response, created_at)"
+        " VALUES (?, ?, ?, ?)",
+        (release_id, fingerprint, response, now),
     )

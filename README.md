@@ -10,6 +10,16 @@
 - 同一 `request_id` + 相同内容 → **幂等**，直接返回原结果；
 - 同一 `request_id` + 不同内容（patch 或 base_revision 变化）→ **409**。
 
+多篇文档需要**同生共死**地一起发布时，使用 `POST /releases` **原子发布**：
+
+- 一批 2～20 项更新（`document_id` 互不重复）在**同一 SQLite 写事务**内逐项执行
+  与单文档接口完全相同的三方合并与契约校验；
+- 任一文档不存在 / 基线无效 / 合并冲突 / 契约失败 → **整批回滚**，
+  按输入顺序汇总返回结构化失败项，任何文档都不产生修订；
+- 全部通过才一次性写入各文档的新修订，返回各项最终 `revision` / `content`；
+- `release_id` 对规范化整批请求做**持久化幂等**：相同请求重放原结果，
+  不同请求返回 `409`，失败的批次不占用 ID。
+
 每个文档还可以挂载一个**可选的 [JSON Schema 2020-12](https://json-schema.org/draft/2020-12) 契约**：
 
 - 设置契约时先校验 Schema **本身**是否合法，并在**同一事务**内验证当前文档；
@@ -67,6 +77,7 @@ docker compose down -v       # 停止并删除数据卷
 | `GET` | `/documents` | 列出文档 |
 | `GET` | `/documents/{id}` | 读取当前版本（含 `revision`） |
 | `PATCH` | `/documents/{id}` | 提交 Merge Patch（三方合并，存在契约时最终校验） |
+| `POST` | `/releases` | 原子发布：同一事务内批量更新 2～20 篇文档，整批成功或整批回滚 |
 | `GET` | `/documents/{id}/revisions` | 修订历史（支持 `limit`/`offset`/`order=asc|desc`） |
 | `GET` | `/documents/{id}/revisions/{rev}` | 查询指定修订的内容与 patch |
 | `PUT` | `/documents/{id}/schema` | 设置 / 替换 JSON Schema 2020-12 契约 |
@@ -176,6 +187,94 @@ HTTP/1.1 409 Conflict
 
 同 `request_id` 但 `base_revision` 或 `patch` 不同 → `409 request_id_conflict`。
 指纹为 `sha256(base_revision + 规范化JSON(patch))`，幂等记录按 `(document_id, request_id)` 持久化。
+
+## 原子发布（POST /releases）
+
+把 2～20 篇文档的更新打包成**一个批次**发布：所有更新在**同一 SQLite 写事务**
+（`BEGIN IMMEDIATE`）内逐项执行与单文档 PATCH 完全相同的逻辑——
+Merge Patch 应用到基线 →（基线过期时）三方重放 → 契约校验最终候选内容。
+**全部通过才一次性写入**；任何一项失败都整批回滚，任何文档都不会产生修订。
+
+```bash
+curl -X POST http://localhost:8000/releases \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "release_id": "rel-2026-001",
+        "items": [
+          {"document_id": "demo",  "base_revision": 3, "patch": {"a": 100}, "author": "alice"},
+          {"document_id": "other", "base_revision": 1, "patch": {"x": true}}
+        ]
+      }'
+```
+
+- `release_id`：调用方生成的整批去重 ID（1～200 字符）；
+- `items`：2～20 项，`document_id` 互不重复，按输入顺序处理；每项字段与
+  单文档 PATCH 一致（`base_revision` / `patch` / 可选 `author`），
+  只是用 `document_id` 替代路径参数、且无需单项 `request_id`；
+- 单项更新请继续使用 `PATCH /documents/{id}`（批量接口最少 2 项）。
+
+### 发布成功（200）
+
+```json
+{
+  "release_id": "rel-2026-001",
+  "idempotent": false,
+  "created_at": "2026-09-19T08:00:00.000000Z",
+  "items": [
+    {"document_id": "demo",  "revision": 4, "base_revision": 3,
+     "replayed": false, "changed": true,
+     "content": {"a": 100, "b": 2}, "created_at": "2026-09-19T08:00:00.000000Z"},
+    {"document_id": "other", "revision": 2, "base_revision": 1,
+     "replayed": false, "changed": true,
+     "content": {"x": true}, "created_at": "2026-09-19T08:00:00.000000Z"}
+  ]
+}
+```
+
+- `items` 按**输入顺序**返回各项的最终 `revision` / `content`；
+- 某项合并结果与其当前版完全相同时，该文档不生成新修订
+  （`"changed": false`，`revision` 保持原号），不影响整批成功；
+- 发布产生的修订在修订历史中以 `release_id` 作为 `request_id`，可追溯来源；
+- 整批共享同一个 `created_at` 时间戳。
+
+### 任一项失败（422，整批回滚）
+
+```json
+HTTP/1.1 422 Unprocessable Entity
+{
+  "detail": {
+    "error": "release_failed",
+    "release_id": "rel-2026-001",
+    "reason": "部分文档更新失败，整批已回滚",
+    "failures": [
+      {"index": 0, "error": "conflict", "document_id": "demo",
+       "base_revision": 3, "current_revision": 4,
+       "conflicts": [{"path": "/a",
+                      "values": {"base": 1, "current": 50, "theirs": 100},
+                      "missing": []}]},
+      {"index": 2, "error": "not_found", "document_id": "ghost"}
+    ]
+  }
+}
+```
+
+- `failures` 按**输入顺序**汇总**全部**失败项（不是快速失败），每项带
+  `index`（在请求 `items` 中的下标）、`document_id` 与具体 `error`：
+  `not_found` / `unknown_base_revision` / `conflict` / `schema_validation_failed`，
+  细节字段（`conflicts`、`errors` 等）与单文档接口的对应错误完全一致；
+- 整批在事务内回滚：**所有文档的修订号与内容均不变**，且 `release_id` 不被占用，
+  修正后可用同一 ID 重新发布。
+
+### 整批幂等
+
+`release_id` 的指纹为 `sha256(规范化JSON(整批 items))`
+（逐项 `document_id` / `base_revision` / `patch` / `author`，按输入顺序）：
+
+- 同 `release_id` + 相同整批内容 → 重放首次成功的原始响应
+  （`"idempotent": true`），不产生新修订；
+- 同 `release_id` + 不同内容（任一项的任何字段不同）→ `409 release_id_conflict`；
+- **失败的批次不占用 `release_id`**（只有整批成功才持久化幂等记录）；
+- 幂等记录存放在独立的 `releases` 表中，随 SQLite 数据卷持久化，重启后仍有效。
 
 ### 修订历史
 
@@ -314,8 +413,10 @@ HTTP/1.1 422 Unprocessable Entity
 | `404 schema_not_found` | 文档存在但未设置契约（GET） |
 | `409 conflict` | 三方合并存在分歧路径 |
 | `409 request_id_conflict` | 同一 request_id 对应了不同内容 |
+| `409 release_id_conflict` | 同一 release_id 对应了不同的整批内容 |
 | `409 document_exists` | 创建时 ID 已存在 |
 | `422 unknown_base_revision` | base_revision 不是该文档的现存修订 |
+| `422 release_failed` | 原子发布中任一项失败（整批回滚，`failures` 按输入顺序列出） |
 | `422 invalid_schema` | 设置契约时 Schema 本身不符合 JSON Schema 2020-12 |
 | `422 schema_validation_failed` | 当前文档（设置时）或合并后的最终候选（PATCH 时）不满足契约 |
 
@@ -324,16 +425,17 @@ HTTP/1.1 422 Unprocessable Entity
 ```
 .
 ├── app/
-│   ├── main.py        # FastAPI 路由与更新编排（事务、幂等、冲突响应、契约接口）
+│   ├── main.py        # FastAPI 路由与更新编排（事务、幂等、冲突响应、契约接口、原子发布）
 │   ├── merge.py       # RFC 7386 打补丁 + 递归三方合并（无框架依赖，可单测）
 │   ├── validation.py  # JSON Schema 2020-12 元校验与实例校验（错误稳定排序）
-│   ├── db.py          # SQLite 连接、自动建表、文档/修订/幂等/契约表读写
+│   ├── db.py          # SQLite 连接、自动建表、文档/修订/幂等/契约/发布表读写
 │   ├── schemas.py     # Pydantic 请求模型（额外字段拒绝）
 │   └── config.py      # 环境变量配置
 ├── tests/
 │   ├── test_merge.py     # 合并算法单元测试（25 例）
 │   ├── test_api.py       # API 集成测试（23 例，独立临时数据库）
-│   └── test_contracts.py # 契约接口与 PATCH 校验集成测试（19 例）
+│   ├── test_contracts.py # 契约接口与 PATCH 校验集成测试（19 例）
+│   └── test_releases.py  # 原子发布集成测试（17 例，独立临时数据库）
 ├── Dockerfile
 ├── docker-compose.yml
 ├── requirements.txt
